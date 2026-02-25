@@ -1,0 +1,19 @@
+# Intermediate conversion files
+*_reprojected.tif
+*.mbtiles
+
+# Output files (too large for git)
+*.pmtiles
+
+# Test data (too large for git)
+test/*.tif
+test/*.tfw
+test/*.pmtiles
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~

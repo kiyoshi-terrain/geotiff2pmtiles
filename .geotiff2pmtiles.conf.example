@@ -1,0 +1,23 @@
+# ~/.geotiff2pmtiles.conf
+# geotiff2pmtiles のデフォルト設定
+# コマンドラインフラグで上書き可能
+
+# デフォルトの平面直角座標系 系番号 (I-XIX)
+# 空欄にするとファイルから自動検出を試みます
+# DEFAULT_ZONE=IV
+
+# デフォルトの EPSG コード (DEFAULT_ZONE より優先)
+# DEFAULT_SRS=
+
+# WebP 品質 (1-100)
+DEFAULT_QUALITY=85
+
+# 透過にするピクセル値 (白枠除去)
+# 黒枠の場合: DEFAULT_NODATA="0 0 0"
+DEFAULT_NODATA="255 255 255"
+
+# オーバービューレベル
+DEFAULT_OVERVIEWS="2 4 8 16 32 64"
+
+# 中間ファイルを残す (true/false)
+DEFAULT_KEEP=false

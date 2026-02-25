@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+# geotiff2pmtiles — GeoTIFF を PMTiles に変換するツール
+# https://github.com/jrse/geotiff2pmtiles
+set -euo pipefail
+
+VERSION="1.0.0"
+SCRIPT_NAME="geotiff2pmtiles"
+
+# ─── カラー出力 ────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+log_info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_step()  { echo -e "${CYAN}${BOLD}$*${NC}"; }
+
+# ─── デフォルト値 ──────────────────────────────────────
+
+SRC_EPSG=""
+QUALITY=85
+NODATA="255 255 255"
+OVERVIEWS="2 4 8 16 32 64"
+KEEP=false
+VERBOSE=false
+DRY_RUN=false
+POSITIONAL=()
+
+# ─── 設定ファイル読み込み ──────────────────────────────
+
+CONFIG_FILE="${HOME}/.geotiff2pmtiles.conf"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    # 設定ファイルのデフォルト値を適用
+    [[ -n "${DEFAULT_ZONE:-}" ]]     && SRC_EPSG=$(zone_to_epsg "$DEFAULT_ZONE" 2>/dev/null || true)
+    [[ -n "${DEFAULT_SRS:-}" ]]      && SRC_EPSG="${DEFAULT_SRS}"
+    [[ -n "${DEFAULT_QUALITY:-}" ]]  && QUALITY="${DEFAULT_QUALITY}"
+    [[ -n "${DEFAULT_NODATA:-}" ]]   && NODATA="${DEFAULT_NODATA}"
+    [[ -n "${DEFAULT_OVERVIEWS:-}" ]] && OVERVIEWS="${DEFAULT_OVERVIEWS}"
+    [[ "${DEFAULT_KEEP:-}" == "true" ]] && KEEP=true
+fi
+
+# ─── 平面直角座標系 → EPSG マッピング ──────────────────
+
+zone_to_epsg() {
+    local zone="$1"
+    case "$zone" in
+        I|1)       echo 6669 ;;
+        II|2)      echo 6670 ;;
+        III|3)     echo 6671 ;;
+        IV|4)      echo 6672 ;;
+        V|5)       echo 6673 ;;
+        VI|6)      echo 6674 ;;
+        VII|7)     echo 6675 ;;
+        VIII|8)    echo 6676 ;;
+        IX|9)      echo 6677 ;;
+        X|10)      echo 6678 ;;
+        XI|11)     echo 6679 ;;
+        XII|12)    echo 6680 ;;
+        XIII|13)   echo 6681 ;;
+        XIV|14)    echo 6682 ;;
+        XV|15)     echo 6683 ;;
+        XVI|16)    echo 6684 ;;
+        XVII|17)   echo 6685 ;;
+        XVIII|18)  echo 6686 ;;
+        XIX|19)    echo 6687 ;;
+        *)
+            log_error "不明な系番号: $zone"
+            log_error "使用可能: I-XIX (ローマ数字) または 1-19 (数字)"
+            return 1
+            ;;
+    esac
+}
+
+epsg_to_zone_label() {
+    local epsg="$1"
+    case "$epsg" in
+        6669) echo "系I (長崎)" ;;
+        6670) echo "系II (福岡)" ;;
+        6671) echo "系III (山口)" ;;
+        6672) echo "系IV (四国)" ;;
+        6673) echo "系V (広島)" ;;
+        6674) echo "系VI (大阪)" ;;
+        6675) echo "系VII (金沢)" ;;
+        6676) echo "系VIII (新潟)" ;;
+        6677) echo "系IX (東京)" ;;
+        6678) echo "系X (青森)" ;;
+        6679) echo "系XI (札幌)" ;;
+        6680) echo "系XII (北見)" ;;
+        6681) echo "系XIII (帯広)" ;;
+        6682) echo "系XIV (離島)" ;;
+        6683) echo "系XV (離島)" ;;
+        6684) echo "系XVI (離島)" ;;
+        6685) echo "系XVII (離島)" ;;
+        6686) echo "系XVIII (離島)" ;;
+        6687) echo "系XIX (離島)" ;;
+        *)    echo "EPSG:${epsg}" ;;
+    esac
+}
+
+show_zone_table() {
+    echo ""
+    echo "  平面直角座標系 (JGD2011) 対応表:"
+    echo "  ─────────────────────────────────────────────"
+    echo "   系    EPSG   地域     │  系     EPSG   地域"
+    echo "  ─────────────────────────────────────────────"
+    echo "   I     6669   長崎     │  X      6678   青森"
+    echo "   II    6670   福岡     │  XI     6679   札幌"
+    echo "   III   6671   山口     │  XII    6680   北見"
+    echo "   IV    6672   四国     │  XIII   6681   帯広"
+    echo "   V     6673   広島     │  XIV    6682   離島"
+    echo "   VI    6674   大阪     │  XV     6683   離島"
+    echo "   VII   6675   金沢     │  XVI    6684   離島"
+    echo "   VIII  6676   新潟     │  XVII   6685   離島"
+    echo "   IX    6677   東京     │  XVIII  6686   離島"
+    echo "                         │  XIX    6687   離島"
+    echo "  ─────────────────────────────────────────────"
+    echo ""
+}
+
+# ─── ヘルプ表示 ────────────────────────────────────────
+
+show_usage() {
+    cat <<'USAGE'
+Usage: geotiff2pmtiles [OPTIONS] <INPUT> [OUTPUT_DIR]
+
+GeoTIFF を PMTiles (WebP タイル) に変換します。
+
+Arguments:
+  INPUT       .tif ファイル または .tif を含むフォルダ
+  OUTPUT_DIR  出力先ディレクトリ (省略時: 入力と同じ場所)
+
+Options:
+  -s, --srs EPSG       ソースEPSGコード (例: 6672)
+  -z, --zone ZONE      平面直角座標系の系番号 (例: IV, 4)
+  -q, --quality NUM    WebP品質 1-100 (デフォルト: 85)
+  -n, --nodata VALUE   透過にするピクセル値 (デフォルト: "255 255 255")
+  -k, --keep           中間ファイルを残す
+  -o, --overviews STR  オーバービューレベル (デフォルト: "2 4 8 16 32 64")
+  -v, --verbose        GDAL出力を表示
+  -d, --dry-run        実行せず内容を表示
+  -h, --help           このヘルプを表示
+  --version            バージョン表示
+
+Examples:
+  geotiff2pmtiles --zone IV slope_map.tif
+  geotiff2pmtiles --zone IV ./input_tifs/ ./output/
+  geotiff2pmtiles -s 6672 -q 90 --keep large_map.tif
+
+USAGE
+    show_zone_table
+}
+
+# ─── 依存関係チェック ──────────────────────────────────
+
+check_dependencies() {
+    local missing=()
+    for cmd in gdalinfo gdalwarp gdal_translate gdaladdo pmtiles; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "必要なツールが見つかりません: ${missing[*]}"
+        echo ""
+        echo "  インストール方法:"
+        echo "    brew install gdal pmtiles"
+        echo ""
+        echo "  または setup.sh を実行してください:"
+        echo "    bash setup.sh"
+        exit 1
+    fi
+
+    # WebP サポート確認
+    if ! gdal_translate --formats 2>/dev/null | grep -qi "WEBP"; then
+        log_error "GDAL に WebP サポートがありません"
+        echo ""
+        echo "  修正方法:"
+        echo "    brew reinstall gdal"
+        exit 1
+    fi
+}
+
+# ─── EPSG 自動検出 ─────────────────────────────────────
+
+detect_epsg() {
+    local input="$1"
+
+    # gdalinfo -json で CRS 情報を取得し python3 でパース
+    local epsg
+    epsg=$(gdalinfo -json "$input" 2>/dev/null | python3 -c "
+import json, sys, re
+try:
+    d = json.load(sys.stdin)
+    wkt = d.get('coordinateSystem', {}).get('wkt', '')
+    if not wkt:
+        sys.exit(1)
+
+    # ENGCRS / LOCAL_CS はCRS情報なし（TFWのみのファイル等）
+    if wkt.startswith('ENGCRS') or wkt.startswith('LOCAL_CS'):
+        sys.exit(1)
+
+    # WKT から EPSG コードを抽出
+    matches = re.findall(r'ID\[\"EPSG\",(\d+)\]', wkt)
+    if not matches:
+        sys.exit(1)
+
+    # CRS コード範囲のみ抽出 (2000-7999)
+    # 8000-8999 = パラメータコード, 9000-9999 = 単位/軸コード, <2000 = datum等
+    crs_codes = [int(m) for m in matches if 2000 <= int(m) <= 7999]
+    if not crs_codes:
+        sys.exit(1)
+
+    # WKT2 では outermost PROJCRS/GEOGCRS の ID が末尾 → 最後のコードを使用
+    print(crs_codes[-1])
+except Exception:
+    sys.exit(1)
+" 2>/dev/null) || true
+
+    if [[ -n "$epsg" ]]; then
+        echo "$epsg"
+        return 0
+    fi
+    return 1
+}
+
+# ─── 単体ファイル変換 ─────────────────────────────────
+
+convert_single() {
+    local input="$1"
+    local output_dir="$2"
+    local src_epsg="$3"
+    local quality="$4"
+    local nodata="$5"
+    local overviews="$6"
+    local keep="$7"
+    local verbose="$8"
+    local dry_run="$9"
+
+    local basename
+    basename=$(basename "$input" .tif)
+    local output="${output_dir}/${basename}.pmtiles"
+
+    # 出力先ディレクトリ確認
+    if [[ ! -d "$output_dir" ]]; then
+        mkdir -p "$output_dir"
+    fi
+
+    # 既存ファイル確認
+    if [[ -f "$output" ]]; then
+        log_warn "出力ファイルを上書きします: ${output}"
+    fi
+
+    # 一時ディレクトリ
+    local tmpdir
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/geotiff2pmtiles.XXXXXX")
+
+    local reprojected="${tmpdir}/${basename}_reprojected.tif"
+    local mbtiles="${tmpdir}/${basename}.mbtiles"
+
+    # Verbose 制御
+    local quiet_flag=""
+    if [[ "$verbose" != "true" ]]; then
+        quiet_flag="-q"
+    fi
+
+    # Dry-run モード
+    if [[ "$dry_run" == "true" ]]; then
+        echo ""
+        log_info "Dry-run: 以下のコマンドが実行されます"
+        echo ""
+        echo "  [1/4] gdalwarp -s_srs EPSG:${src_epsg} -t_srs EPSG:3857 -r bilinear \\"
+        echo "          -srcnodata \"${nodata}\" -dstalpha \\"
+        echo "          \"${input}\" \"${reprojected}\""
+        echo ""
+        echo "  [2/4] gdal_translate -of MBTiles -co TILE_FORMAT=WEBP -co QUALITY=${quality} \\"
+        echo "          \"${reprojected}\" \"${mbtiles}\""
+        echo ""
+        echo "  [3/4] gdaladdo -r average \"${mbtiles}\" ${overviews}"
+        echo ""
+        echo "  [4/4] pmtiles convert \"${mbtiles}\" \"${output}\""
+        echo ""
+        rm -rf "$tmpdir"
+        return 0
+    fi
+
+    local start_time
+    start_time=$(date +%s)
+
+    # Step 1: リプロジェクション
+    log_step "[1/4] リプロジェクション (EPSG:${src_epsg} → EPSG:3857) ..."
+    if [[ "$verbose" == "true" ]]; then
+        gdalwarp \
+            -s_srs "EPSG:${src_epsg}" \
+            -t_srs EPSG:3857 \
+            -r bilinear \
+            -srcnodata "${nodata}" \
+            -dstalpha \
+            "$input" "$reprojected" || {
+            log_error "gdalwarp が失敗しました"
+            rm -rf "$tmpdir"
+            return 1
+        }
+    else
+        gdalwarp \
+            -s_srs "EPSG:${src_epsg}" \
+            -t_srs EPSG:3857 \
+            -r bilinear \
+            -srcnodata "${nodata}" \
+            -dstalpha \
+            -q \
+            "$input" "$reprojected" || {
+            log_error "gdalwarp が失敗しました"
+            rm -rf "$tmpdir"
+            return 1
+        }
+    fi
+
+    # Step 2: MBTiles (WebP) 変換
+    log_step "[2/4] MBTiles 変換 (WebP q=${quality}) ..."
+    if [[ "$verbose" == "true" ]]; then
+        gdal_translate \
+            -of MBTiles \
+            -co TILE_FORMAT=WEBP \
+            -co "QUALITY=${quality}" \
+            "$reprojected" "$mbtiles" || {
+            log_error "gdal_translate が失敗しました"
+            rm -rf "$tmpdir"
+            return 1
+        }
+    else
+        gdal_translate \
+            -of MBTiles \
+            -co TILE_FORMAT=WEBP \
+            -co "QUALITY=${quality}" \
+            -q \
+            "$reprojected" "$mbtiles" || {
+            log_error "gdal_translate が失敗しました"
+            rm -rf "$tmpdir"
+            return 1
+        }
+    fi
+
+    # Step 3: オーバービュー生成
+    log_step "[3/4] オーバービュー生成 (${overviews}) ..."
+    if [[ "$verbose" == "true" ]]; then
+        # shellcheck disable=SC2086
+        gdaladdo -r average "$mbtiles" ${overviews} || {
+            log_error "gdaladdo が失敗しました"
+            rm -rf "$tmpdir"
+            return 1
+        }
+    else
+        # shellcheck disable=SC2086
+        gdaladdo -r average -q "$mbtiles" ${overviews} || {
+            log_error "gdaladdo が失敗しました"
+            rm -rf "$tmpdir"
+            return 1
+        }
+    fi
+
+    # Step 4: PMTiles 変換
+    log_step "[4/4] PMTiles 変換 ..."
+    pmtiles convert "$mbtiles" "$output" 2>/dev/null || {
+        log_error "pmtiles convert が失敗しました"
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    # 結果表示
+    local end_time
+    end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    local input_size
+    input_size=$(du -h "$input" | cut -f1 | xargs)
+    local output_size
+    output_size=$(du -h "$output" | cut -f1 | xargs)
+
+    echo ""
+    log_ok "${basename}.pmtiles 完成!"
+    echo "     入力: ${input_size} → 出力: ${output_size} (${elapsed}秒)"
+    echo "     場所: ${output}"
+
+    # クリーンアップ
+    if [[ "$keep" == "true" ]]; then
+        log_info "中間ファイル: ${tmpdir}/"
+    else
+        rm -rf "$tmpdir"
+    fi
+
+    return 0
+}
+
+# ─── バッチ処理 ────────────────────────────────────────
+
+process_batch() {
+    local input_dir="$1"
+    local output_dir="$2"
+    local src_epsg="$3"
+    local quality="$4"
+    local nodata="$5"
+    local overviews="$6"
+    local keep="$7"
+    local verbose="$8"
+    local dry_run="$9"
+
+    local files=()
+    while IFS= read -r -d '' f; do
+        files+=("$f")
+    done < <(find "$input_dir" -maxdepth 1 -name "*.tif" -print0 | sort -z)
+
+    local total=${#files[@]}
+    if [[ $total -eq 0 ]]; then
+        log_error "フォルダ内に .tif ファイルが見つかりません: ${input_dir}"
+        exit 1
+    fi
+
+    echo ""
+    log_info "${total} 件の GeoTIFF を変換します"
+    echo "  入力: ${input_dir}"
+    echo "  出力: ${output_dir}"
+    echo "============================================"
+
+    local succeeded=0
+    local failed=0
+    local failed_files=()
+
+    for i in "${!files[@]}"; do
+        local n=$((i + 1))
+        local file_basename
+        file_basename=$(basename "${files[$i]}")
+
+        echo ""
+        echo "────────────────────────────────────────────"
+        log_info "[${n}/${total}] ${file_basename}"
+        echo "────────────────────────────────────────────"
+
+        # ファイルごとに EPSG を検出（指定がない場合）
+        local file_epsg="$src_epsg"
+        if [[ -z "$file_epsg" ]]; then
+            file_epsg=$(detect_epsg "${files[$i]}") || true
+            if [[ -z "$file_epsg" ]]; then
+                log_warn "EPSG を検出できません。スキップします: ${file_basename}"
+                log_warn "--srs または --zone を指定してください"
+                failed=$((failed + 1))
+                failed_files+=("${file_basename} (EPSG不明)")
+                continue
+            fi
+            log_info "EPSG自動検出: $(epsg_to_zone_label "$file_epsg") (EPSG:${file_epsg})"
+        fi
+
+        if convert_single "${files[$i]}" "$output_dir" "$file_epsg" "$quality" "$nodata" "$overviews" "$keep" "$verbose" "$dry_run"; then
+            succeeded=$((succeeded + 1))
+        else
+            failed=$((failed + 1))
+            failed_files+=("${file_basename}")
+        fi
+    done
+
+    # サマリー
+    echo ""
+    echo "============================================"
+    if [[ $failed -eq 0 ]]; then
+        log_ok "全 ${total} 件の変換が完了しました!"
+    else
+        log_warn "完了: ${succeeded} 成功 / ${failed} 失敗 (全${total}件)"
+        echo ""
+        echo "  失敗ファイル:"
+        for f in "${failed_files[@]}"; do
+            echo "    - $f"
+        done
+    fi
+    echo "============================================"
+}
+
+# ─── SIGINT トラップ ───────────────────────────────────
+
+cleanup() {
+    echo ""
+    log_warn "中断されました。一時ファイルをクリーンアップします..."
+    # mktemp で作成された一時ディレクトリを削除
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name "geotiff2pmtiles.*" -type d -exec rm -rf {} + 2>/dev/null || true
+    exit 130
+}
+trap cleanup INT TERM
+
+# ─── 引数パース ────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s|--srs)
+            SRC_EPSG="$2"
+            shift 2
+            ;;
+        -z|--zone)
+            SRC_EPSG=$(zone_to_epsg "$2")
+            shift 2
+            ;;
+        -q|--quality)
+            QUALITY="$2"
+            shift 2
+            ;;
+        -n|--nodata)
+            NODATA="$2"
+            shift 2
+            ;;
+        -k|--keep)
+            KEEP=true
+            shift
+            ;;
+        -o|--overviews)
+            OVERVIEWS="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -d|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        --version)
+            echo "${SCRIPT_NAME} ${VERSION}"
+            exit 0
+            ;;
+        -*)
+            log_error "不明なオプション: $1"
+            echo ""
+            show_usage
+            exit 1
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# ─── メイン処理 ────────────────────────────────────────
+
+# 引数チェック
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+    show_usage
+    exit 1
+fi
+
+INPUT="${POSITIONAL[0]}"
+OUTPUT_DIR="${POSITIONAL[1]:-}"
+
+# 依存関係チェック
+check_dependencies
+
+# 入力確認
+if [[ ! -e "$INPUT" ]]; then
+    log_error "入力が見つかりません: ${INPUT}"
+    exit 1
+fi
+
+# ─── 単体 or バッチ判定 ─────────────────────────────────
+
+if [[ -d "$INPUT" ]]; then
+    # バッチモード: フォルダ指定
+    if [[ -z "$OUTPUT_DIR" ]]; then
+        OUTPUT_DIR="$INPUT"
+    fi
+    process_batch "$INPUT" "$OUTPUT_DIR" "$SRC_EPSG" "$QUALITY" "$NODATA" "$OVERVIEWS" "$KEEP" "$VERBOSE" "$DRY_RUN"
+elif [[ -f "$INPUT" ]]; then
+    # 単体モード: ファイル指定
+    if [[ -z "$OUTPUT_DIR" ]]; then
+        OUTPUT_DIR=$(dirname "$INPUT")
+    fi
+
+    # EPSG 未指定の場合、自動検出を試行
+    if [[ -z "$SRC_EPSG" ]]; then
+        log_info "EPSG コードを自動検出中..."
+        SRC_EPSG=$(detect_epsg "$INPUT") || true
+        if [[ -n "$SRC_EPSG" ]]; then
+            log_ok "検出: $(epsg_to_zone_label "$SRC_EPSG") (EPSG:${SRC_EPSG})"
+        else
+            log_error "EPSG コードを自動検出できませんでした"
+            echo ""
+            echo "  --srs または --zone を指定してください:"
+            echo "    geotiff2pmtiles --zone IV ${INPUT}"
+            echo "    geotiff2pmtiles --srs 6672 ${INPUT}"
+            show_zone_table
+            exit 1
+        fi
+    fi
+
+    # EPSG:3857 / 4326 チェック
+    if [[ "$SRC_EPSG" == "3857" ]]; then
+        log_info "入力は既に EPSG:3857 (Web Mercator) です。リプロジェクションをスキップします。"
+    fi
+
+    echo ""
+    log_info "変換開始"
+    echo "  入力: ${INPUT}"
+    echo "  CRS:  $(epsg_to_zone_label "$SRC_EPSG") (EPSG:${SRC_EPSG})"
+    echo "  品質: WebP q=${QUALITY}"
+    echo "  出力: ${OUTPUT_DIR}/"
+    echo ""
+
+    convert_single "$INPUT" "$OUTPUT_DIR" "$SRC_EPSG" "$QUALITY" "$NODATA" "$OVERVIEWS" "$KEEP" "$VERBOSE" "$DRY_RUN"
+else
+    log_error "入力はファイルでもフォルダでもありません: ${INPUT}"
+    exit 1
+fi
