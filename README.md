@@ -1,7 +1,20 @@
 # geotiff2pmtiles
 
-GeoTIFF を PMTiles (WebP タイル) に変換するコマンドラインツール。
+GeoTIFF を PMTiles (WebP タイル) に変換するツール。
 鉄道斜面点検で使用する赤色立体地図等の地図タイル生成に特化。
+
+## 🌐 Web版（ブラウザで即使用可）
+
+**https://kiyoshi-terrain.github.io/geotiff2pmtiles/**
+
+インストール不要。ブラウザでGeoTIFFをドラッグ＆ドロップするだけで PMTiles に変換できます。
+- 複数ファイル・フォルダ一括変換対応
+- CRS自動検出（平面直角座標系 I〜XIX）
+- gdal3.js (WASM) でブラウザ内完結
+
+---
+
+## 🖥️ CLI版
 
 ## セットアップ (macOS)
 
