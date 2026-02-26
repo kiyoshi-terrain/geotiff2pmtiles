@@ -344,12 +344,14 @@
   .result-file.failed { border-left: 3px solid var(--error); opacity: 0.7; }
   .result-file-name { flex: 1; word-break: break-all; }
   .result-file-info { font-size: 0.75rem; color: var(--text2); white-space: nowrap; }
-  .result-file-dl {
+  .result-file-dl, .result-file-dl-mbtiles {
     background: none; border: 1px solid var(--success); color: var(--success);
     padding: 4px 10px; border-radius: 6px; font-size: 0.75rem;
     cursor: pointer; white-space: nowrap;
   }
-  .result-file-dl:hover { background: rgba(0, 229, 160, 0.1); }
+  .result-file-dl:hover, .result-file-dl-mbtiles:hover { background: rgba(0, 229, 160, 0.1); }
+  .result-file-dl-mbtiles { border-color: var(--accent); color: var(--accent); }
+  .result-file-dl-mbtiles:hover { background: rgba(0, 180, 255, 0.1); }
 
   .download-btn {
     width: 100%; padding: 14px; border: none; border-radius: 12px;
@@ -1211,6 +1213,7 @@ async function convertSingleFile(file, srcEPSG, quality) {
     '-of', 'MBTiles', '-co', 'TILE_FORMAT=WEBP', '-co', `QUALITY=${quality}`,
   ]);
   const mbtilesBytes = await Gdal.getFileBytes(translateOutput.real);
+  const mbtilesBlob = new Blob([mbtilesBytes], { type: 'application/octet-stream' });
   log(`  MBTiles: ${formatBytes(mbtilesBytes.length)}`, 'info');
   await Gdal.close(inputDs);
   await Gdal.close(warpedDs);
@@ -1242,6 +1245,9 @@ async function convertSingleFile(file, srcEPSG, quality) {
   return {
     name: `${inputName}.pmtiles`,
     blob: new Blob([pmtilesData], { type: 'application/octet-stream' }),
+    mbtilesBlob,
+    mbtilesName: `${inputName}.mbtiles`,
+    mbtilesSize: mbtilesBytes.length,
     inputSize: file.size,
     outputSize: pmtilesData.length,
     tiles: allTiles.length,
@@ -1366,17 +1372,26 @@ async function startConversion() {
         <span class="file-item-icon">✅</span>
         <span class="result-file-name">${r.name}</span>
         <span class="result-file-info">${formatBytes(r.outputSize)} / ${r.tiles} tiles / ${r.time}s</span>
-        <button class="result-file-dl" data-name="${r.name}">📥 DL</button>
+        <button class="result-file-dl" data-name="${r.name}">📥 PMTiles</button>
+        <button class="result-file-dl-mbtiles" data-name="${r.name}">🗄️ MBTiles</button>
       `;
     }
     $resultFiles.appendChild(div);
   }
 
-  // Per-file download buttons
+  // Per-file download buttons (PMTiles)
   $resultFiles.querySelectorAll('.result-file-dl').forEach(btn => {
     btn.addEventListener('click', () => {
       const r = results.find(r => r.name === btn.dataset.name);
       if (r && r.blob) { downloadBlob(r.blob, r.name); log(`Download: ${r.name}`, 'ok'); }
+    });
+  });
+
+  // Per-file download buttons (MBTiles for QGIS)
+  $resultFiles.querySelectorAll('.result-file-dl-mbtiles').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const r = results.find(r => r.name === btn.dataset.name);
+      if (r && r.mbtilesBlob) { downloadBlob(r.mbtilesBlob, r.mbtilesName); log(`Download: ${r.mbtilesName}`, 'ok'); }
     });
   });
 
@@ -1421,11 +1436,14 @@ $downloadAllBtn.addEventListener('click', async () => {
 
   try {
     const zip = new JSZip();
+    const pmtilesFolder = zip.folder('pmtiles');
+    const mbtilesFolder = zip.folder('mbtiles');
     for (const r of successResults) {
-      zip.file(r.name, r.blob);
+      pmtilesFolder.file(r.name, r.blob);
+      if (r.mbtilesBlob) { mbtilesFolder.file(r.mbtilesName, r.mbtilesBlob); }
     }
     const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-    const zipName = `pmtiles_${successResults.length}files.zip`;
+    const zipName = `tiles_${successResults.length}files.zip`;
     downloadBlob(zipBlob, zipName);
     log(`Download: ${zipName} (${formatBytes(zipBlob.size)})`, 'ok');
   } catch (e) {
