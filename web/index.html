@@ -986,7 +986,7 @@ function buildHeader(opts) {
   writeUint64LE(view, 72, opts.numAddressedTiles);
   writeUint64LE(view, 80, opts.numTileEntries);
   writeUint64LE(view, 88, opts.numTileContents);
-  u8[96] = 1; u8[97] = 2; u8[98] = 2; u8[99] = 4;
+  u8[96] = 1; u8[97] = 2; u8[98] = 1; u8[99] = 4; // clustered, internal=gzip, tile=none, type=webp
   u8[100] = opts.minZoom; u8[101] = opts.maxZoom;
   view.setInt32(102, writeFloat32AsInt(opts.minLon), true);
   view.setInt32(106, writeFloat32AsInt(opts.minLat), true);
@@ -998,7 +998,29 @@ function buildHeader(opts) {
   return new Uint8Array(buf);
 }
 
-function assemblePMTiles(tiles, metadata) {
+async function gzipCompress(data) {
+  const cs = new CompressionStream('gzip');
+  const writer = cs.writable.getWriter();
+  writer.write(data);
+  writer.close();
+  const chunks = [];
+  const reader = cs.readable.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const totalLength = chunks.reduce((s, c) => s + c.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+async function assemblePMTiles(tiles, metadata) {
   const entries = tiles.map(t => ({
     tileId: zxyToTileId(t.z, t.x, t.y),
     data: t.data, offset: 0, length: t.data.length, runLength: 1,
@@ -1006,10 +1028,12 @@ function assemblePMTiles(tiles, metadata) {
   entries.sort((a, b) => a.tileId - b.tileId);
   let dataOffset = 0;
   for (const e of entries) { e.offset = dataOffset; dataOffset += e.length; }
-  const dirBytes = buildDirectory(entries);
-  const metaBytes = new TextEncoder().encode(JSON.stringify({
+  const dirBytesRaw = buildDirectory(entries);
+  const dirBytes = await gzipCompress(dirBytesRaw);
+  const metaBytesRaw = new TextEncoder().encode(JSON.stringify({
     name: metadata.name || 'geotiff2pmtiles', format: 'webp', type: 'overlay',
   }));
+  const metaBytes = await gzipCompress(metaBytesRaw);
   const HEADER_LEN = 127;
   const rootDirOffset = HEADER_LEN, rootDirLength = dirBytes.length;
   const metadataOffset = rootDirOffset + rootDirLength, metadataLength = metaBytes.length;
@@ -1208,7 +1232,7 @@ async function convertSingleFile(file, srcEPSG, quality) {
   setStep('pmtiles', 'active');
   stepStart = performance.now();
   meta.name = inputName;
-  const pmtilesData = assemblePMTiles(allTiles, meta);
+  const pmtilesData = await assemblePMTiles(allTiles, meta);
   setStep('pmtiles', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
 
   return {
