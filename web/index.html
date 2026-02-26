@@ -1424,7 +1424,7 @@ $downloadAllBtn.addEventListener('click', async () => {
     for (const r of successResults) {
       zip.file(r.name, r.blob);
     }
-    const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'STORED' });
+    const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
     const zipName = `pmtiles_${successResults.length}files.zip`;
     downloadBlob(zipBlob, zipName);
     log(`Download: ${zipName} (${formatBytes(zipBlob.size)})`, 'ok');
