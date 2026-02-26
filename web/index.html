@@ -629,6 +629,7 @@
 <!-- External Libraries -->
 <script src="https://cdn.jsdelivr.net/npm/gdal3.js@2.8.1/dist/package/gdal3.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 
 <script>
 // ============================================================
@@ -1402,14 +1403,41 @@ async function startConversion() {
 // ============================================================
 // Download All
 // ============================================================
-$downloadAllBtn.addEventListener('click', () => {
+$downloadAllBtn.addEventListener('click', async () => {
   const successResults = results.filter(r => !r.error && r.blob);
-  successResults.forEach((r, i) => {
-    setTimeout(() => {
-      downloadBlob(r.blob, r.name);
-      log(`Download (${i + 1}/${successResults.length}): ${r.name}`, 'ok');
-    }, i * 500); // stagger 500ms between each download to avoid browser blocking
-  });
+  if (successResults.length === 0) return;
+
+  // Single file: direct download
+  if (successResults.length === 1) {
+    downloadBlob(successResults[0].blob, successResults[0].name);
+    log(`Download: ${successResults[0].name}`, 'ok');
+    return;
+  }
+
+  // Multiple files: bundle into ZIP
+  $downloadAllBtn.disabled = true;
+  $downloadAllBtn.textContent = '⏳ Creating ZIP...';
+  log(`Packing ${successResults.length} files into ZIP...`, 'info');
+
+  try {
+    const zip = new JSZip();
+    for (const r of successResults) {
+      zip.file(r.name, r.blob);
+    }
+    const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'STORED' });
+    const zipName = `pmtiles_${successResults.length}files.zip`;
+    downloadBlob(zipBlob, zipName);
+    log(`Download: ${zipName} (${formatBytes(zipBlob.size)})`, 'ok');
+  } catch (e) {
+    log(`ZIP error: ${e.message}`, 'error');
+    // Fallback: staggered individual downloads
+    successResults.forEach((r, i) => {
+      setTimeout(() => downloadBlob(r.blob, r.name), i * 500);
+    });
+  }
+
+  $downloadAllBtn.disabled = false;
+  $downloadAllBtn.textContent = `📥 Download all ${successResults.length} file(s)`;
 });
 
 // ============================================================
