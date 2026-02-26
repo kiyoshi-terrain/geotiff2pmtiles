@@ -722,7 +722,10 @@ function downloadBlob(blob, filename) {
 // ============================================================
 // File Input — Multiple files & folder support
 // ============================================================
-$dropzone.addEventListener('click', () => $fileInput.click());
+$dropzone.addEventListener('click', (e) => {
+  if (e.target.closest('input[type="file"]')) return; // prevent bubbling from folder/file input
+  $fileInput.click();
+});
 $dropzone.addEventListener('dragover', (e) => {
   e.preventDefault();
   $dropzone.classList.add('dragover');
