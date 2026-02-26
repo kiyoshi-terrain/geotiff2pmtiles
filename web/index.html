@@ -716,7 +716,7 @@ function downloadBlob(blob, filename) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 10000); // delay revoke to ensure download starts
 }
 
 // ============================================================
@@ -1404,10 +1404,12 @@ async function startConversion() {
 // ============================================================
 $downloadAllBtn.addEventListener('click', () => {
   const successResults = results.filter(r => !r.error && r.blob);
-  for (const r of successResults) {
-    downloadBlob(r.blob, r.name);
-  }
-  log(`Downloading ${successResults.length} file(s)`, 'ok');
+  successResults.forEach((r, i) => {
+    setTimeout(() => {
+      downloadBlob(r.blob, r.name);
+      log(`Download (${i + 1}/${successResults.length}): ${r.name}`, 'ok');
+    }, i * 500); // stagger 500ms between each download to avoid browser blocking
+  });
 });
 
 // ============================================================
