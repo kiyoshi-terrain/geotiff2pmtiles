@@ -194,6 +194,26 @@
   }
   .file-summary.show { display: block; }
 
+  /* Merge */
+  .merge-card { transition: border-color 0.15s, box-shadow 0.15s; }
+  .merge-card.dragover { border-color: var(--accent); box-shadow: 0 0 20px var(--glow-dim); }
+  .merge-card [hidden] { display: none !important; }
+  .card-title-note {
+    margin-left: 6px; font-size: 0.68rem; font-weight: 500; letter-spacing: 0.5px;
+    color: var(--text2); text-shadow: none; text-transform: none;
+  }
+  .merge-hint { font-size: 0.82rem; line-height: 1.6; color: var(--text2); }
+  .merge-card .input-buttons { justify-content: flex-start; }
+  .merge-name-row { margin: 16px 0 12px; }
+  .merge-card input[type="text"] {
+    background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); padding: 8px 12px; font-size: 0.9rem; min-width: 160px; flex: 0 1 220px;
+  }
+  .merge-status { margin-top: 12px; font-size: 0.85rem; color: var(--text2); word-break: break-all; }
+  .merge-status.error { color: var(--error); }
+  .merge-status.ok { color: var(--success); }
+  .merge-result { margin-top: 12px; }
+
   .clear-all-btn {
     background: none; border: 1px solid var(--border); color: var(--text2);
     padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; cursor: pointer;
@@ -610,6 +630,36 @@
     </div>
     <div class="result-files" id="resultFiles"></div>
     <button class="download-btn" id="downloadAllBtn" style="display:none">📥 Download All</button>
+  </div>
+
+  <!-- Merge -->
+  <div class="card merge-card" id="mergeCard">
+    <div class="card-title">3. Merge PMTiles<span class="card-title-note">optional</span></div>
+    <p class="merge-hint">Combine converted .pmtiles into one file. Tiles that overlap at sheet edges are blended; all other tiles are copied as-is without re-encoding. Drop files onto this card or use the buttons.</p>
+    <div class="input-buttons">
+      <button class="input-btn" id="mergeAddFilesBtn">📄 Add .pmtiles</button>
+      <button class="input-btn" id="mergeAddFolderBtn">📁 Select Folder</button>
+      <input type="file" id="mergeFileInput" accept=".pmtiles" multiple hidden>
+      <input type="file" id="mergeFolderInput" webkitdirectory hidden>
+    </div>
+    <div class="file-list" id="mergeFileList"></div>
+    <div class="file-summary" id="mergeSummary"></div>
+    <div class="setting-row merge-name-row">
+      <div class="setting-label">Output name<small>saved as .pmtiles</small></div>
+      <input type="text" id="mergeName" value="merged" spellcheck="false" autocomplete="off">
+    </div>
+    <button class="convert-btn" id="mergeBtn" disabled>Merge</button>
+    <div class="merge-status" id="mergeStatus"></div>
+    <div class="progress-bar-container" id="mergeProgressWrap" hidden>
+      <div class="progress-bar" id="mergeProgressBar"></div>
+    </div>
+    <div class="result-info merge-result" id="mergeResult" hidden>
+      <div class="result-item"><div class="label">Input Total</div><div class="value" id="mergeInSize">-</div></div>
+      <div class="result-item"><div class="label">Output</div><div class="value" id="mergeOutSize">-</div></div>
+      <div class="result-item"><div class="label">Tiles</div><div class="value" id="mergeTileCount">-</div></div>
+      <div class="result-item"><div class="label">Blended</div><div class="value" id="mergeBlendCount">-</div></div>
+    </div>
+    <button class="download-btn" id="mergeDownloadBtn" hidden>📥 Download</button>
   </div>
 </div>
 
@@ -1044,7 +1094,7 @@ function buildHeader(opts) {
   writeUint64LE(view, 72, opts.numAddressedTiles);
   writeUint64LE(view, 80, opts.numTileEntries);
   writeUint64LE(view, 88, opts.numTileContents);
-  u8[96] = 1; u8[97] = 2; u8[98] = 1; u8[99] = 4; // clustered, internal=gzip, tile=none, type=webp
+  u8[96] = 1; u8[97] = 2; u8[98] = 1; u8[99] = opts.tileType || 4; // clustered, internal=gzip, tile=none, type (4=webp)
   u8[100] = opts.minZoom; u8[101] = opts.maxZoom;
   view.setInt32(102, writeFloat32AsInt(opts.minLon), true);
   view.setInt32(106, writeFloat32AsInt(opts.minLat), true);
@@ -1078,43 +1128,194 @@ async function gzipCompress(data) {
   return result;
 }
 
+const PMTILES_TILE_TYPE = { png: 2, jpeg: 3, webp: 4 };
+const PMTILES_TYPE_MIME = { 2: 'image/png', 3: 'image/jpeg', 4: 'image/webp' };
+const PMTILES_TYPE_NAME = { 2: 'png', 3: 'jpeg', 4: 'webp' };
+// Readers fetch the first 16 KiB and expect header + root directory inside it.
+const ROOT_DIR_BUDGET = 16384 - 127;
+
+function concatBytes(chunks) {
+  const total = chunks.reduce((s, c) => s + c.length, 0);
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const c of chunks) { out.set(c, pos); pos += c.length; }
+  return out;
+}
+
+// Build the root directory, splitting into leaf directories when the root would
+// not fit in the first 16 KiB (needed once a file holds thousands of tiles).
+async function buildDirectories(entries) {
+  const root = await gzipCompress(buildDirectory(entries));
+  if (root.length <= ROOT_DIR_BUDGET) return { root, leaves: new Uint8Array(0) };
+  for (let leafSize = 4096; ; leafSize *= 2) {
+    const rootEntries = [], leafChunks = [];
+    let leafOffset = 0;
+    for (let i = 0; i < entries.length; i += leafSize) {
+      const chunk = entries.slice(i, i + leafSize);
+      const leaf = await gzipCompress(buildDirectory(chunk));
+      rootEntries.push({ tileId: chunk[0].tileId, offset: leafOffset, length: leaf.length, runLength: 0 });
+      leafChunks.push(leaf);
+      leafOffset += leaf.length;
+    }
+    const root2 = await gzipCompress(buildDirectory(rootEntries));
+    if (root2.length <= ROOT_DIR_BUDGET) return { root: root2, leaves: concatBytes(leafChunks) };
+  }
+}
+
 async function assemblePMTiles(tiles, metadata) {
   const entries = tiles.map(t => ({
-    tileId: zxyToTileId(t.z, t.x, t.y),
+    tileId: t.tileId !== undefined ? t.tileId : zxyToTileId(t.z, t.x, t.y),
     data: t.data, offset: 0, length: t.data.length, runLength: 1,
   }));
   entries.sort((a, b) => a.tileId - b.tileId);
   let dataOffset = 0;
   for (const e of entries) { e.offset = dataOffset; dataOffset += e.length; }
-  const dirBytesRaw = buildDirectory(entries);
-  const dirBytes = await gzipCompress(dirBytesRaw);
+  const { root: dirBytes, leaves: leafBytes } = await buildDirectories(entries);
+  const tileType = metadata.tileType || PMTILES_TILE_TYPE.webp;
   const metaBytesRaw = new TextEncoder().encode(JSON.stringify({
-    name: metadata.name || 'geotiff2pmtiles', format: 'webp', type: 'overlay',
+    name: metadata.name || 'geotiff2pmtiles', format: PMTILES_TYPE_NAME[tileType] || 'webp', type: 'overlay',
   }));
   const metaBytes = await gzipCompress(metaBytesRaw);
   const HEADER_LEN = 127;
   const rootDirOffset = HEADER_LEN, rootDirLength = dirBytes.length;
   const metadataOffset = rootDirOffset + rootDirLength, metadataLength = metaBytes.length;
-  const tileDataOffset = metadataOffset + metadataLength, tileDataLength = dataOffset;
+  const leafDirOffset = metadataOffset + metadataLength, leafDirLength = leafBytes.length;
+  const tileDataOffset = leafDirOffset + leafDirLength, tileDataLength = dataOffset;
   const headerBytes = buildHeader({
     rootDirOffset, rootDirLength, metadataOffset, metadataLength,
-    leafDirOffset: 0, leafDirLength: 0, tileDataOffset, tileDataLength,
+    leafDirOffset, leafDirLength, tileDataOffset, tileDataLength,
     numAddressedTiles: entries.length, numTileEntries: entries.length,
-    numTileContents: entries.length,
+    numTileContents: entries.length, tileType,
     minZoom: metadata.minZoom, maxZoom: metadata.maxZoom,
     minLon: metadata.bounds[0], minLat: metadata.bounds[1],
     maxLon: metadata.bounds[2], maxLat: metadata.bounds[3],
     centerZoom: Math.floor((metadata.minZoom + metadata.maxZoom) / 2),
     centerLon: metadata.center[0], centerLat: metadata.center[1],
   });
-  const totalSize = HEADER_LEN + rootDirLength + metadataLength + tileDataLength;
-  const output = new Uint8Array(totalSize);
+  const output = new Uint8Array(tileDataOffset + tileDataLength);
   output.set(headerBytes, 0);
   output.set(dirBytes, rootDirOffset);
   output.set(metaBytes, metadataOffset);
+  output.set(leafBytes, leafDirOffset);
   let pos = tileDataOffset;
   for (const e of entries) { output.set(e.data, pos); pos += e.data.length; }
   return output;
+}
+
+// ============================================================
+// PMTiles v3 Reader (for Merge)
+// ============================================================
+function hilbertToXY(n, d) {
+  let x = 0, y = 0, t = d;
+  for (let s = 1; s < n; s *= 2) {
+    const rx = 1 & Math.floor(t / 2);
+    const ry = 1 & (t ^ rx);
+    if (ry === 0) {
+      if (rx === 1) { x = s - 1 - x; y = s - 1 - y; }
+      [x, y] = [y, x];
+    }
+    x += s * rx; y += s * ry;
+    t = Math.floor(t / 4);
+  }
+  return [x, y];
+}
+
+function tileIdToZxy(tileId) {
+  let acc = 0;
+  for (let z = 0; z < 32; z++) {
+    const count = Math.pow(4, z);
+    if (acc + count > tileId) {
+      const [x, y] = hilbertToXY(Math.pow(2, z), tileId - acc);
+      return [z, x, y];
+    }
+    acc += count;
+  }
+  throw new Error(`tile id out of range: ${tileId}`);
+}
+
+function readUint64LE(view, offset) {
+  return view.getUint32(offset, true) + view.getUint32(offset + 4, true) * 0x100000000;
+}
+
+async function gunzipBytes(data) {
+  const ds = new DecompressionStream('gzip');
+  const writer = ds.writable.getWriter();
+  writer.write(data);
+  writer.close();
+  const chunks = [];
+  const reader = ds.readable.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  return concatBytes(chunks);
+}
+
+function decodeDirectory(bytes) {
+  let pos = 0;
+  const readVarint = () => {
+    let result = 0, mult = 1, b;
+    do {
+      if (pos >= bytes.length) throw new Error('truncated directory');
+      b = bytes[pos++];
+      result += (b & 0x7f) * mult;
+      mult *= 128;
+    } while (b & 0x80);
+    return result;
+  };
+  const n = readVarint();
+  const entries = new Array(n);
+  let lastId = 0;
+  for (let i = 0; i < n; i++) { lastId += readVarint(); entries[i] = { tileId: lastId, runLength: 0, length: 0, offset: 0 }; }
+  for (let i = 0; i < n; i++) entries[i].runLength = readVarint();
+  for (let i = 0; i < n; i++) entries[i].length = readVarint();
+  for (let i = 0; i < n; i++) {
+    const v = readVarint();
+    entries[i].offset = (v === 0 && i > 0) ? entries[i - 1].offset + entries[i - 1].length : v - 1;
+  }
+  return entries;
+}
+
+// Reads a whole .pmtiles file into { header, tiles: [{ tileId, data }] }.
+async function readPMTiles(buffer) {
+  const u8 = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  const magic = String.fromCharCode(...u8.slice(0, 7));
+  if (magic !== 'PMTiles' || u8[7] !== 3) throw new Error('not a PMTiles v3 file');
+  const h = {
+    rootDirOffset: readUint64LE(view, 8), rootDirLength: readUint64LE(view, 16),
+    leafDirOffset: readUint64LE(view, 40), leafDirLength: readUint64LE(view, 48),
+    tileDataOffset: readUint64LE(view, 56), tileDataLength: readUint64LE(view, 64),
+    internalCompression: u8[97], tileCompression: u8[98], tileType: u8[99],
+    minZoom: u8[100], maxZoom: u8[101],
+    bounds: [view.getInt32(102, true) / 1e7, view.getInt32(106, true) / 1e7,
+             view.getInt32(110, true) / 1e7, view.getInt32(114, true) / 1e7],
+  };
+  if (h.internalCompression !== 1 && h.internalCompression !== 2) {
+    throw new Error(`unsupported directory compression (${h.internalCompression})`);
+  }
+  if (h.tileCompression !== 0 && h.tileCompression !== 1) {
+    throw new Error(`compressed raster tiles are not supported (${h.tileCompression})`);
+  }
+  const readDir = async (offset, length) => {
+    let bytes = u8.subarray(offset, offset + length);
+    if (h.internalCompression === 2) bytes = await gunzipBytes(bytes);
+    return decodeDirectory(bytes);
+  };
+  const tiles = [];
+  const walk = async (entries) => {
+    for (const e of entries) {
+      if (e.runLength === 0) {
+        await walk(await readDir(h.leafDirOffset + e.offset, e.length));
+      } else {
+        const data = u8.subarray(h.tileDataOffset + e.offset, h.tileDataOffset + e.offset + e.length);
+        for (let k = 0; k < e.runLength; k++) tiles.push({ tileId: e.tileId + k, data });
+      }
+    }
+  };
+  await walk(await readDir(h.rootDirOffset, h.rootDirLength));
+  return { header: h, tiles };
 }
 
 // ============================================================
@@ -1548,6 +1749,265 @@ $downloadAllBtn.addEventListener('click', async () => {
   $downloadAllBtn.disabled = false;
   $downloadAllBtn.textContent = `📥 Download all ${successResults.length} file(s)`;
 });
+
+// ============================================================
+// Merge PMTiles
+// ============================================================
+let mergeFiles = [];
+let mergeOutput = null;   // { blob, name }
+let mergeRunning = false;
+let compositeCanvas = null;
+const $mergeCard        = $('mergeCard');
+const $mergeFileInput   = $('mergeFileInput');
+const $mergeFolderInput = $('mergeFolderInput');
+const $mergeFileList    = $('mergeFileList');
+const $mergeSummary     = $('mergeSummary');
+const $mergeName        = $('mergeName');
+const $mergeBtn         = $('mergeBtn');
+const $mergeStatus      = $('mergeStatus');
+const $mergeProgressWrap = $('mergeProgressWrap');
+const $mergeProgressBar = $('mergeProgressBar');
+const $mergeResult      = $('mergeResult');
+const $mergeDownloadBtn = $('mergeDownloadBtn');
+
+$('mergeAddFilesBtn').addEventListener('click', () => $mergeFileInput.click());
+$('mergeAddFolderBtn').addEventListener('click', () => $mergeFolderInput.click());
+[$mergeFileInput, $mergeFolderInput].forEach(input => input.addEventListener('change', (e) => {
+  addMergeFiles(e.target.files);
+  e.target.value = '';
+}));
+$mergeCard.addEventListener('dragover', (e) => { e.preventDefault(); $mergeCard.classList.add('dragover'); });
+$mergeCard.addEventListener('dragleave', (e) => {
+  if (!$mergeCard.contains(e.relatedTarget)) $mergeCard.classList.remove('dragover');
+});
+$mergeCard.addEventListener('drop', (e) => {
+  e.preventDefault();
+  $mergeCard.classList.remove('dragover');
+  addMergeFiles(e.dataTransfer.files);
+});
+$mergeBtn.addEventListener('click', runMerge);
+$mergeDownloadBtn.addEventListener('click', () => {
+  if (mergeOutput) downloadBlob(mergeOutput.blob, mergeOutput.name);
+});
+
+function addMergeFiles(fileListObj) {
+  if (mergeRunning) return;
+  for (const f of fileListObj) {
+    if (!/\.pmtiles$/i.test(f.name)) continue;
+    if (mergeFiles.some(m => m.name === f.name && m.size === f.size)) continue;
+    mergeFiles.push(f);
+  }
+  mergeFiles.sort((a, b) => a.name.localeCompare(b.name, 'ja', { numeric: true }));
+  renderMergeList();
+}
+
+function renderMergeList() {
+  $mergeFileList.innerHTML = '';
+  $mergeFileList.classList.toggle('show', mergeFiles.length > 0);
+  mergeFiles.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'file-item';
+    const icon = document.createElement('span'); icon.className = 'file-item-icon'; icon.textContent = '🧩';
+    const name = document.createElement('span'); name.className = 'file-item-name'; name.textContent = f.name;
+    const size = document.createElement('span'); size.className = 'file-item-size'; size.textContent = formatBytes(f.size);
+    const rm = document.createElement('button'); rm.className = 'file-item-remove'; rm.title = 'Remove'; rm.textContent = '✕';
+    rm.addEventListener('click', () => { if (mergeRunning) return; mergeFiles.splice(i, 1); renderMergeList(); });
+    div.append(icon, name, size, rm);
+    $mergeFileList.appendChild(div);
+  });
+  if (mergeFiles.length > 0) {
+    const total = mergeFiles.reduce((s, f) => s + f.size, 0);
+    $mergeSummary.textContent = `${mergeFiles.length} file(s) (${formatBytes(total)}) `;
+    const clear = document.createElement('button');
+    clear.className = 'clear-all-btn'; clear.textContent = 'Clear All';
+    clear.addEventListener('click', () => { if (mergeRunning) return; mergeFiles = []; renderMergeList(); });
+    $mergeSummary.appendChild(clear);
+    $mergeSummary.classList.add('show');
+  } else {
+    $mergeSummary.classList.remove('show');
+  }
+  $mergeBtn.disabled = mergeRunning || mergeFiles.length < 2;
+  $mergeBtn.textContent = mergeFiles.length >= 2 ? `Merge ${mergeFiles.length} files` : 'Merge (select 2 or more)';
+}
+
+function setMergeStatus(text, kind = '') {
+  $mergeStatus.textContent = text;
+  $mergeStatus.className = `merge-status${kind ? ' ' + kind : ''}`;
+}
+
+function setMergeProgress(pct) {
+  $mergeProgressBar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+}
+
+function mergeOutputName() {
+  const raw = ($mergeName.value || '').trim().replace(/\.pmtiles$/i, '').replace(/[\\/:*?"<>|]/g, '_');
+  return raw || 'merged';
+}
+
+// Draw overlapping tiles bottom-to-top (input order) and re-encode in the source format.
+async function compositeTiles(list, mime, quality) {
+  const bitmaps = [];
+  try {
+    for (const d of list) {
+      try { bitmaps.push(await createImageBitmap(new Blob([d], { type: mime }))); } catch (e) { /* skip undecodable */ }
+    }
+    if (bitmaps.length === 0) return list[list.length - 1];
+    if (bitmaps.length === 1) return list[0];
+    const w = bitmaps[0].width, h = bitmaps[0].height;
+    if (!compositeCanvas) compositeCanvas = document.createElement('canvas');
+    compositeCanvas.width = w; compositeCanvas.height = h;
+    const ctx = compositeCanvas.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    for (const b of bitmaps) ctx.drawImage(b, 0, 0, w, h);
+    if (mime !== 'image/jpeg') {
+      const img = ctx.getImageData(0, 0, w, h);
+      if (closeHairlineGaps(img.data, w, h) > 0) ctx.putImageData(img, 0, 0);
+    }
+    const blob = await new Promise(r => compositeCanvas.toBlob(r, mime, quality));
+    if (!blob) throw new Error('tile encoding failed');
+    return new Uint8Array(await blob.arrayBuffer());
+  } finally {
+    bitmaps.forEach(b => b.close && b.close());
+  }
+}
+
+// gdalwarp leaves the outermost ~half pixel of every sheet transparent, so two sheets that
+// abut leave a 1-2 px see-through line between them. Fill pixels that are not fully opaque
+// but are bracketed by opaque pixels (left/right or up/down) within 2 px. Wider transparent
+// areas (real nodata, the mosaic's outer edge) are left untouched.
+function closeHairlineGaps(px, w, h) {
+  const alpha = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) alpha[i] = px[i * 4 + 3];
+  let filled = 0;
+  const fill = (i, a, b) => {
+    for (let k = 0; k < 3; k++) px[i * 4 + k] = (px[a * 4 + k] + px[b * 4 + k] + 1) >> 1;
+    px[i * 4 + 3] = 255;
+    filled++;
+  };
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (alpha[i] === 255) continue;
+      // horizontal bracket: opaque at x-1 and (x+1 or x+2 with x+1 also not opaque)
+      if (x > 0 && alpha[i - 1] === 255) {
+        if (x + 1 < w && alpha[i + 1] === 255) { fill(i, i - 1, i + 1); continue; }
+        if (x + 2 < w && alpha[i + 1] !== 255 && alpha[i + 2] === 255) { fill(i, i - 1, i + 2); fill(i + 1, i - 1, i + 2); continue; }
+      }
+      if (y > 0 && alpha[i - w] === 255) {
+        if (y + 1 < h && alpha[i + w] === 255) { fill(i, i - w, i + w); continue; }
+        if (y + 2 < h && alpha[i + w] !== 255 && alpha[i + 2 * w] === 255) { fill(i, i - w, i + 2 * w); fill(i + w, i - w, i + 2 * w); continue; }
+      }
+    }
+  }
+  return filled;
+}
+
+function sameBytes(a, b) {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+async function runMerge() {
+  if (mergeRunning || mergeFiles.length < 2) return;
+  const files = [...mergeFiles];
+  const outName = mergeOutputName();
+  const quality = Math.min(100, Math.max(1, parseInt($quality.value) || 85)) / 100;
+  mergeRunning = true;
+  mergeOutput = null;
+  $mergeBtn.disabled = true;
+  $mergeResult.hidden = true;
+  $mergeDownloadBtn.hidden = true;
+  $mergeProgressWrap.hidden = false;
+  setMergeProgress(0);
+  const t0 = performance.now();
+
+  try {
+    // 1. Read every input and group tiles by tile id
+    const groups = new Map();
+    let tileType = null, minZoom = 99, maxZoom = 0, inputTiles = 0, inputBytes = 0;
+    const bounds = [Infinity, Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      setMergeStatus(`Reading ${i + 1}/${files.length}: ${f.name}`);
+      setMergeProgress((i / files.length) * 40);
+      let parsed;
+      try {
+        parsed = await readPMTiles(await f.arrayBuffer());
+      } catch (e) {
+        throw new Error(`${f.name}: ${e.message}`);
+      }
+      const { header, tiles } = parsed;
+      if (!PMTILES_TYPE_MIME[header.tileType]) {
+        throw new Error(`${f.name}: only raster PMTiles (PNG/JPEG/WebP) can be merged (tile type ${header.tileType})`);
+      }
+      if (tileType === null) tileType = header.tileType;
+      else if (header.tileType !== tileType) {
+        throw new Error(`${f.name}: tile format ${PMTILES_TYPE_NAME[header.tileType]} differs from ${PMTILES_TYPE_NAME[tileType]} — convert all inputs with the same format`);
+      }
+      minZoom = Math.min(minZoom, header.minZoom);
+      maxZoom = Math.max(maxZoom, header.maxZoom);
+      bounds[0] = Math.min(bounds[0], header.bounds[0]); bounds[1] = Math.min(bounds[1], header.bounds[1]);
+      bounds[2] = Math.max(bounds[2], header.bounds[2]); bounds[3] = Math.max(bounds[3], header.bounds[3]);
+      for (const t of tiles) {
+        const g = groups.get(t.tileId);
+        if (g) g.push(t.data); else groups.set(t.tileId, [t.data]);
+      }
+      inputTiles += tiles.length;
+      inputBytes += f.size;
+    }
+
+    // 2. Copy unique tiles, blend overlapping ones
+    const mime = PMTILES_TYPE_MIME[tileType];
+    const overlapping = [...groups.values()].filter(g => g.length > 1).length;
+    const out = [];
+    let blended = 0, done = 0;
+    for (const [tileId, list] of groups) {
+      if (list.length === 1 || list.every(d => sameBytes(d, list[0]))) {
+        out.push({ tileId, data: list[0] });
+      } else {
+        out.push({ tileId, data: await compositeTiles(list, mime, quality) });
+        blended++;
+        done++;
+        if (done % 25 === 0 || done === overlapping) {
+          setMergeStatus(`Blending overlapping tiles ${done}/${overlapping}`);
+          setMergeProgress(40 + (done / Math.max(1, overlapping)) * 50);
+        }
+      }
+    }
+
+    // 3. Write one PMTiles archive
+    setMergeStatus(`Writing ${outName}.pmtiles (${out.length} tiles)...`);
+    setMergeProgress(92);
+    const bytes = await assemblePMTiles(out, {
+      name: outName, tileType, minZoom, maxZoom, bounds,
+      center: [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2],
+    });
+    mergeOutput = { blob: new Blob([bytes], { type: 'application/octet-stream' }), name: `${outName}.pmtiles` };
+
+    setMergeProgress(100);
+    $('mergeInSize').textContent = formatBytes(inputBytes);
+    $('mergeOutSize').textContent = formatBytes(bytes.length);
+    $('mergeTileCount').textContent = out.length.toLocaleString();
+    $('mergeBlendCount').textContent = blended.toLocaleString();
+    $mergeResult.hidden = false;
+    $mergeDownloadBtn.textContent = `📥 Download ${mergeOutput.name}`;
+    $mergeDownloadBtn.hidden = false;
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    setMergeStatus(`Merged ${files.length} files → ${mergeOutput.name} (z${minZoom}–${maxZoom}, ${secs}s)`, 'ok');
+    console.info(`merge: ${files.length} files, ${inputTiles} input tiles → ${out.length} tiles, ${blended} blended`);
+  } catch (e) {
+    setMergeStatus(`Merge failed: ${(e && e.message) || e}`, 'error');
+    $mergeProgressWrap.hidden = true;
+    console.error(e);
+  } finally {
+    mergeRunning = false;
+    renderMergeList();
+  }
+}
+
+renderMergeList();
 
 // ============================================================
 // Service Worker
