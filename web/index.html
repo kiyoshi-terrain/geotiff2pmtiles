@@ -194,6 +194,17 @@
   }
   .file-summary.show { display: block; }
 
+  /* Output folder */
+  .output-dir { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
+  .output-dir-name {
+    font-size: 0.85rem; color: var(--text2); max-width: 180px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .output-dir-name.set { color: var(--accent); }
+  .output-dir .input-btn { padding: 6px 12px; }
+  .output-dir .input-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .result-file-saved { font-size: 0.75rem; color: var(--success); white-space: nowrap; }
+
   /* Merge */
   .merge-card { transition: border-color 0.15s, box-shadow 0.15s; }
   .merge-card.dragover { border-color: var(--accent); box-shadow: 0 0 20px var(--glow-dim); }
@@ -562,6 +573,14 @@
         <button class="nodata-btn active" data-nodata="255 255 255" title="White">⬜ White</button>
         <button class="nodata-btn" data-nodata="0 0 0" title="Black">⬛ Black</button>
         <button class="nodata-btn" data-nodata="none" title="None">🚫 None</button>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">Output folder<small id="outputDirNote">Each file is saved as soon as it finishes</small></div>
+      <div class="output-dir">
+        <span class="output-dir-name" id="outputDirName">Downloads (default)</span>
+        <button class="input-btn" id="chooseDirBtn">📁 Choose</button>
+        <button class="input-btn" id="clearDirBtn" title="Back to downloads" hidden>✕</button>
       </div>
     </div>
   </div>
@@ -973,6 +992,59 @@ document.querySelectorAll('.nodata-btn').forEach(btn => {
     nodataValue = btn.dataset.nodata;
   });
 });
+
+// ============================================================
+// Output folder (File System Access API — Chrome / Edge)
+// ============================================================
+let outputDir = null;  // FileSystemDirectoryHandle
+const canPickDir = typeof window.showDirectoryPicker === 'function';
+const $outputDirName = $('outputDirName');
+const $chooseDirBtn  = $('chooseDirBtn');
+const $clearDirBtn   = $('clearDirBtn');
+
+function renderOutputDir() {
+  if (!canPickDir) {
+    $chooseDirBtn.disabled = true;
+    $('outputDirNote').textContent = 'Needs Chrome or Edge — files are downloaded instead';
+  }
+  $outputDirName.textContent = outputDir ? `📂 ${outputDir.name}` : 'Downloads (default)';
+  $outputDirName.title = outputDir ? outputDir.name : '';
+  $outputDirName.classList.toggle('set', !!outputDir);
+  $clearDirBtn.hidden = !outputDir;
+}
+
+$chooseDirBtn.addEventListener('click', async () => {
+  if (!canPickDir) return;
+  try {
+    outputDir = await window.showDirectoryPicker({ id: 'geotiff2pmtiles-out', mode: 'readwrite' });
+    log(`Output folder: ${outputDir.name}`, 'info');
+  } catch (e) {
+    if (e && e.name !== 'AbortError') log(`Folder selection failed: ${e.message}`, 'error');
+  }
+  renderOutputDir();
+});
+$clearDirBtn.addEventListener('click', () => { outputDir = null; renderOutputDir(); });
+
+// Must be called from a click handler before long awaits (permission prompt needs user activation).
+async function ensureOutputDirPermission() {
+  if (!outputDir) return false;
+  const opts = { mode: 'readwrite' };
+  try {
+    if ((await outputDir.queryPermission(opts)) === 'granted') return true;
+    return (await outputDir.requestPermission(opts)) === 'granted';
+  } catch (e) {
+    return false;
+  }
+}
+
+async function saveToOutputDir(name, blob) {
+  const fh = await outputDir.getFileHandle(name, { create: true });
+  const w = await fh.createWritable();
+  await w.write(blob);
+  await w.close();
+}
+
+renderOutputDir();
 
 // ============================================================
 // Toggle log
@@ -1556,8 +1628,12 @@ $convertBtn.addEventListener('click', startConversion);
 async function startConversion() {
   if (selectedFiles.length === 0) return;
 
+  if ($convertBtn.disabled) return;
+  $convertBtn.disabled = true;  // before the first await so a double click can't start a second run
   const isBatch = selectedFiles.length > 1;
   results = [];
+  // Ask for folder write permission first, while the click still counts as a user gesture.
+  const useDir = outputDir ? await ensureOutputDirPermission() : false;
 
   // UI setup
   $progressCard.classList.add('show');
@@ -1582,6 +1658,8 @@ async function startConversion() {
     Gdal = await initGdalJs(GDAL_CONFIG);
   }
   setStep('init', 'done', '0.0s');
+  if (outputDir && !useDir) log('No write permission for the output folder — results will be downloaded instead', 'error');
+  if (useDir) log(`Saving each result to folder: ${outputDir.name}`, 'info');
 
   for (let i = 0; i < selectedFiles.length; i++) {
     const file = selectedFiles[i];
@@ -1607,9 +1685,21 @@ async function startConversion() {
       const elapsed = ((performance.now() - fileStart) / 1000).toFixed(1);
       result.time = elapsed;
 
+      if (useDir) {
+        try {
+          await saveToOutputDir(result.name, result.blob);
+          result.savedTo = `${outputDir.name}/${result.name}`;
+          result.blob = null;          // free memory — the file is on disk now
+          result.mbtilesBlob = null;
+        } catch (e) {
+          result.saveError = (e && e.message) || String(e);
+          log(`Could not save ${result.name} to folder: ${result.saveError} — kept for download`, 'error');
+        }
+      }
+
       results.push(result);
       successCount++;
-      setFileStatus(i, 'done', `✅ ${formatBytes(result.outputSize)} (${elapsed}s)`);
+      setFileStatus(i, 'done', `✅ ${formatBytes(result.outputSize)} (${elapsed}s)${result.savedTo ? ' 💾' : ''}`);
       log(`Done: ${result.name} — ${formatBytes(result.outputSize)}, ${result.tiles} tiles, ${elapsed}s`, 'ok');
     } catch (e) {
       failCount++;
@@ -1664,8 +1754,10 @@ async function startConversion() {
         <span class="file-item-icon">✅</span>
         <span class="result-file-name">${r.name}</span>
         <span class="result-file-info">${formatBytes(r.outputSize)} / ${r.tiles} tiles / ${r.time}s</span>
-        <button class="result-file-dl" data-name="${r.name}">📥 PMTiles</button>
-        <button class="result-file-dl-mbtiles" data-name="${r.name}">🗄️ MBTiles</button>
+        ${r.savedTo
+          ? `<span class="result-file-saved" title="${r.savedTo}">💾 Saved</span>`
+          : `<button class="result-file-dl" data-name="${r.name}">📥 PMTiles</button>
+             <button class="result-file-dl-mbtiles" data-name="${r.name}">🗄️ MBTiles</button>`}
       `;
     }
     $resultFiles.appendChild(div);
@@ -1687,8 +1779,12 @@ async function startConversion() {
     });
   });
 
-  // Download all button (for batch)
-  const successResults = results.filter(r => !r.error);
+  // Download all button (for batch) — only for results still held in memory
+  const successResults = results.filter(r => !r.error && r.blob);
+  const savedCount = results.filter(r => r.savedTo).length;
+  if (savedCount > 0) {
+    $('resultTitle').textContent += ` — 💾 ${savedCount} saved to ${outputDir ? outputDir.name : 'folder'}`;
+  }
   if (successResults.length > 1) {
     $downloadAllBtn.style.display = 'block';
     $downloadAllBtn.textContent = `📥 Download all ${successResults.length} file(s)`;
@@ -1914,7 +2010,8 @@ async function runMerge() {
   const files = [...mergeFiles];
   const outName = mergeOutputName();
   const quality = Math.min(100, Math.max(1, parseInt($quality.value) || 85)) / 100;
-  mergeRunning = true;
+  mergeRunning = true;   // set before the first await so a double click can't start a second run
+  const mergeUseDir = outputDir ? await ensureOutputDirPermission() : false;
   mergeOutput = null;
   $mergeBtn.disabled = true;
   $mergeResult.hidden = true;
@@ -1994,8 +2091,17 @@ async function runMerge() {
     $mergeResult.hidden = false;
     $mergeDownloadBtn.textContent = `📥 Download ${mergeOutput.name}`;
     $mergeDownloadBtn.hidden = false;
+    let savedNote = '';
+    if (mergeUseDir) {
+      try {
+        await saveToOutputDir(mergeOutput.name, mergeOutput.blob);
+        savedNote = ` — 💾 saved to ${outputDir.name}`;
+      } catch (e) {
+        savedNote = ` — could not save to folder (${(e && e.message) || e}), use Download`;
+      }
+    }
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    setMergeStatus(`Merged ${files.length} files → ${mergeOutput.name} (z${minZoom}–${maxZoom}, ${secs}s)`, 'ok');
+    setMergeStatus(`Merged ${files.length} files → ${mergeOutput.name} (z${minZoom}–${maxZoom}, ${secs}s)${savedNote}`, 'ok');
     console.info(`merge: ${files.length} files, ${inputTiles} input tiles → ${out.length} tiles, ${blended} blended`);
   } catch (e) {
     setMergeStatus(`Merge failed: ${(e && e.message) || e}`, 'error');
