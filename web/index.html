@@ -171,6 +171,12 @@
   }
   .file-item-icon { font-size: 1rem; flex-shrink: 0; }
   .file-item-name { flex: 1; word-break: break-all; }
+  .tfw-badge {
+    display: inline-block; margin-left: 6px; padding: 1px 6px;
+    font-size: 0.68rem; font-weight: 600; letter-spacing: 0.02em;
+    color: var(--accent); border: 1px solid var(--accent); border-radius: 4px;
+    vertical-align: middle;
+  }
   .file-item-size { font-size: 0.75rem; color: var(--text2); white-space: nowrap; }
   .file-item-status { font-size: 0.75rem; color: var(--text2); white-space: nowrap; }
   .file-item-remove {
@@ -478,9 +484,9 @@
       <div class="dropzone-text">
         Drop GeoTIFF files here<br>
         or <strong>click to select</strong>
-        <br><small style="color:var(--text2);font-size:0.78rem">Supports multiple files &amp; folders</small>
+        <br><small style="color:var(--text2);font-size:0.78rem">Supports multiple files &amp; folders · drop the .tfw together with a plain TIFF</small>
       </div>
-      <input type="file" id="fileInput" accept=".tif,.tiff,.geotiff" multiple>
+      <input type="file" id="fileInput" accept=".tif,.tiff,.geotiff,.tfw,.tifw" multiple>
       <input type="file" id="folderInput" webkitdirectory>
     </div>
     <div class="input-buttons">
@@ -637,9 +643,38 @@
 // ============================================================
 // Global State
 // ============================================================
-let selectedFiles = [];  // Array of File objects
+let selectedFiles = [];  // Array of File objects (.tif/.tiff)
+let worldFiles = {};     // basename(lowercase) → File (.tfw sidecar)
+let gdalStderr = [];     // recent GDAL stderr lines (for real error messages)
 let Gdal = null;
 let SQL = null;
+
+// gdal3.js config — errorHandler keeps GDAL's real error text so we can show it
+// instead of the generic "Pointer 'hDS' is NULL" that gdal3.js reports afterwards.
+const GDAL_CONFIG = {
+  path: 'https://cdn.jsdelivr.net/npm/gdal3.js@2.8.1/dist/package',
+  useWorker: false,
+  errorHandler: (text) => {
+    if (!text) return;
+    gdalStderr.push(text);
+    if (gdalStderr.length > 50) gdalStderr.shift();
+    console.error('gdal: ' + text);
+  },
+  logHandler: (text) => { if (text) console.debug('gdal: ' + text); },
+};
+
+// Pick the most informative GDAL error from recent stderr (ignores the hDS-NULL follow-up).
+function gdalRealError(fallback) {
+  const lines = gdalStderr.filter(l => /^ERROR \d+:/.test(l) && !/Pointer 'h\w+' is NULL/.test(l));
+  return lines.length ? lines[lines.length - 1] : fallback;
+}
+
+// Remove files from gdal3.js's in-memory FS so repeated conversions don't accumulate.
+function gdalUnlink(path) {
+  try {
+    if (path && Gdal && Gdal.Module && Gdal.Module.FS) Gdal.Module.FS.unlink(path);
+  } catch (e) { /* not present — fine */ }
+}
 let results = [];  // Array of { name, blob, inputSize, outputSize, tiles, time, error }
 
 // ============================================================
@@ -752,8 +787,21 @@ $folderInput.addEventListener('change', (e) => {
 $('addFilesBtn').addEventListener('click', () => $fileInput.click());
 $('addFolderBtn').addEventListener('click', () => $folderInput.click());
 
+// Base name without extension, lower-cased, used to pair .tif with .tfw
+function baseKey(name) {
+  return name.replace(/\.[^.]+$/, '').toLowerCase();
+}
+
+function worldFileFor(tif) {
+  return worldFiles[baseKey(tif.name)] || null;
+}
+
 function addFiles(fileListObj) {
   for (const f of fileListObj) {
+    if (f.name.match(/\.(tfw|tifw)$/i)) {
+      worldFiles[baseKey(f.name)] = f;
+      continue;
+    }
     if (!f.name.match(/\.tiff?$/i)) continue;
     // Skip duplicates
     if (selectedFiles.some(sf => sf.name === f.name && sf.size === f.size)) continue;
@@ -764,13 +812,18 @@ function addFiles(fileListObj) {
 }
 
 function removeFile(index) {
+  const f = selectedFiles[index];
   selectedFiles.splice(index, 1);
+  if (f && !selectedFiles.some(sf => baseKey(sf.name) === baseKey(f.name))) {
+    delete worldFiles[baseKey(f.name)];
+  }
   renderFileList();
   updateConvertBtn();
 }
 
 function clearAllFiles() {
   selectedFiles = [];
+  worldFiles = {};
   renderFileList();
   updateConvertBtn();
   $crsDetected.classList.remove('show');
@@ -791,9 +844,11 @@ function renderFileList() {
     const div = document.createElement('div');
     div.className = 'file-item';
     div.id = `file-item-${i}`;
+    const tfw = worldFileFor(f);
+    const tfwBadge = tfw ? ` <span class="tfw-badge" title="${tfw.name}">+TFW</span>` : '';
     div.innerHTML = `
       <span class="file-item-icon">📄</span>
-      <span class="file-item-name">${f.name}</span>
+      <span class="file-item-name">${f.name}${tfwBadge}</span>
       <span class="file-item-size">${formatBytes(f.size)}</span>
       <span class="file-item-status" id="file-status-${i}"></span>
       <button class="file-item-remove" data-idx="${i}" title="Remove">✕</button>
@@ -885,10 +940,7 @@ async function initLibraries() {
   try {
     $loadingText.textContent = 'Loading GDAL engine... (~38MB)';
     log('Initializing GDAL (gdal3.js)...', 'info');
-    Gdal = await initGdalJs({
-      path: 'https://cdn.jsdelivr.net/npm/gdal3.js@2.8.1/dist/package',
-      useWorker: false,
-    });
+    Gdal = await initGdalJs(GDAL_CONFIG);
     log('GDAL initialized', 'ok');
 
     $loadingText.textContent = 'Loading SQLite engine...';
@@ -1175,83 +1227,124 @@ function tileToLat(y, n) { return Math.atan(Math.sinh(Math.PI * (1 - 2*y/n))) * 
 // ============================================================
 async function convertSingleFile(file, srcEPSG, quality) {
   const inputName = file.name.replace(/\.tiff?$/i, '');
+  const tfw = worldFileFor(file);
 
-  // Step 1: Open & detect CRS if auto
-  const fileData = await file.arrayBuffer();
-  const inputResult = await Gdal.open(new File([fileData], file.name));
+  // Step 1: Open (.tif + .tfw sidecar together so GDAL can read the world file) & detect CRS
+  gdalStderr = [];
+  const toOpen = tfw ? [file, tfw] : [file];
+  if (tfw) log(`  world file: ${tfw.name}`, 'info');
+  const inputResult = await Gdal.open(toOpen);
   const inputDs = inputResult.datasets[0];
+  const inputPaths = toOpen.map(f => `/input/${f.name}`);
+  let warpOutput = null, translateOutput = null;
+
+  const cleanup = async (...datasets) => {
+    for (const ds of datasets) { if (ds) { try { await Gdal.close(ds); } catch (e) { /* ignore */ } } }
+    inputPaths.forEach(gdalUnlink);
+    if (warpOutput) gdalUnlink(warpOutput.local);
+    if (translateOutput) gdalUnlink(translateOutput.local);
+  };
+
+  if (!inputDs) {
+    const err = (inputResult.errors && inputResult.errors[0] && inputResult.errors[0].message) || 'unknown';
+    inputPaths.forEach(gdalUnlink);
+    throw new Error(`Cannot open ${file.name}: ${gdalRealError(err)}`);
+  }
+
+  // Georeferencing check: a plain TIFF with no embedded geotransform needs its .tfw
+  const info = inputDs.info || {};
+  if (!info.geoTransform) {
+    await cleanup(inputDs);
+    throw new Error(tfw
+      ? `${file.name}: no georeferencing found even with ${tfw.name} (check the world file)`
+      : `${file.name}: no georeferencing in the TIFF. Add its .tfw world file (same base name) together with the .tif`);
+  }
 
   let epsg = srcEPSG;
   if (epsg === 'auto') {
-    const detected = detectCRSFromInfo(inputDs.info);
+    const detected = detectCRSFromInfo(info);
     if (detected) {
       epsg = detected;
       log(`  CRS auto-detected: EPSG:${epsg} (${epsgLabel(epsg)})`, 'ok');
     } else {
-      await Gdal.close(inputDs);
-      throw new Error(`Cannot auto-detect CRS: ${file.name}`);
+      await cleanup(inputDs);
+      throw new Error(`Cannot auto-detect CRS: ${file.name} — select the zone manually`);
     }
   }
 
-  // Step 2: gdalwarp
-  setStep('warp', 'active');
-  const warpOptions = ['-of', 'GTiff', '-t_srs', 'EPSG:3857', '-r', 'bilinear', '-dstalpha'];
-  if (epsg !== 3857) warpOptions.unshift('-s_srs', `EPSG:${epsg}`);
-  if (nodataValue !== 'none') warpOptions.push('-srcnodata', nodataValue);
-  log(`  gdalwarp ${warpOptions.join(' ')}`, 'info');
+  try {
+    // Step 2: gdalwarp
+    setStep('warp', 'active');
+    const warpOptions = ['-of', 'GTiff', '-t_srs', 'EPSG:3857', '-r', 'bilinear', '-dstalpha'];
+    if (epsg !== 3857) warpOptions.unshift('-s_srs', `EPSG:${epsg}`);
+    if (nodataValue !== 'none') warpOptions.push('-srcnodata', nodataValue);
+    log(`  gdalwarp ${warpOptions.join(' ')}`, 'info');
 
-  let stepStart = performance.now();
-  const warpOutput = await Gdal.gdalwarp(inputDs, warpOptions);
-  const warpedResult = await Gdal.open(warpOutput.real);
-  const warpedDs = warpedResult.datasets[0];
-  setStep('warp', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
+    let stepStart = performance.now();
+    try {
+      warpOutput = await Gdal.gdalwarp(inputDs, warpOptions);
+    } catch (e) {
+      throw new Error(`gdalwarp failed: ${gdalRealError(e && e.message)}`);
+    }
+    const warpedResult = await Gdal.open(warpOutput.real);
+    const warpedDs = warpedResult.datasets[0];
+    if (!warpedDs) throw new Error(`gdalwarp produced no output: ${gdalRealError('unknown')}`);
+    setStep('warp', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
 
-  // Step 3: gdal_translate → MBTiles
-  setStep('translate', 'active');
-  stepStart = performance.now();
-  const translateOutput = await Gdal.gdal_translate(warpedDs, [
-    '-of', 'MBTiles', '-co', 'TILE_FORMAT=WEBP', '-co', `QUALITY=${quality}`,
-  ]);
-  const mbtilesBytes = await Gdal.getFileBytes(translateOutput.real);
-  const mbtilesBlob = new Blob([mbtilesBytes], { type: 'application/octet-stream' });
-  log(`  MBTiles: ${formatBytes(mbtilesBytes.length)}`, 'info');
-  await Gdal.close(inputDs);
-  await Gdal.close(warpedDs);
-  setStep('translate', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
+    // Step 3: gdal_translate → MBTiles
+    setStep('translate', 'active');
+    stepStart = performance.now();
+    try {
+      translateOutput = await Gdal.gdal_translate(warpedDs, [
+        '-of', 'MBTiles', '-co', 'TILE_FORMAT=WEBP', '-co', `QUALITY=${quality}`,
+      ]);
+    } catch (e) {
+      await Gdal.close(warpedDs);
+      throw new Error(`gdal_translate failed: ${gdalRealError(e && e.message)}`);
+    }
+    const mbtilesBytes = await Gdal.getFileBytes(translateOutput.real);
+    const mbtilesBlob = new Blob([mbtilesBytes], { type: 'application/octet-stream' });
+    log(`  MBTiles: ${formatBytes(mbtilesBytes.length)}`, 'info');
+    await cleanup(inputDs, warpedDs);
+    setStep('translate', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
 
-  // Step 4: Overviews
-  setStep('overview', 'active');
-  stepStart = performance.now();
-  const mbResult = readMBTiles(mbtilesBytes);
-  let allTiles = mbResult.tiles;
-  const meta = mbResult.metadata;
-  log(`  tiles: ${allTiles.length}, zoom: ${meta.minZoom}-${meta.maxZoom}`, 'info');
+    // Step 4: Overviews
+    setStep('overview', 'active');
+    stepStart = performance.now();
+    const mbResult = readMBTiles(mbtilesBytes);
+    let allTiles = mbResult.tiles;
+    const meta = mbResult.metadata;
+    log(`  tiles: ${allTiles.length}, zoom: ${meta.minZoom}-${meta.maxZoom}`, 'info');
 
-  if (allTiles.length > 0 && meta.maxZoom > 0) {
-    allTiles = await generateOverviews(allTiles, meta.maxZoom);
-    let newMin = Infinity;
-    for (const t of allTiles) if (t.z < newMin) newMin = t.z;
-    meta.minZoom = newMin;
+    if (allTiles.length > 0 && meta.maxZoom > 0) {
+      allTiles = await generateOverviews(allTiles, meta.maxZoom);
+      let newMin = Infinity;
+      for (const t of allTiles) if (t.z < newMin) newMin = t.z;
+      meta.minZoom = newMin;
+    }
+    setStep('overview', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
+
+    // Step 5: PMTiles
+    setStep('pmtiles', 'active');
+    stepStart = performance.now();
+    meta.name = inputName;
+    const pmtilesData = await assemblePMTiles(allTiles, meta);
+    setStep('pmtiles', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
+
+    return {
+      name: `${inputName}.pmtiles`,
+      blob: new Blob([pmtilesData], { type: 'application/octet-stream' }),
+      mbtilesBlob,
+      mbtilesName: `${inputName}.mbtiles`,
+      mbtilesSize: mbtilesBytes.length,
+      inputSize: file.size,
+      outputSize: pmtilesData.length,
+      tiles: allTiles.length,
+    };
+  } catch (e) {
+    await cleanup(inputDs);
+    throw e;
   }
-  setStep('overview', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
-
-  // Step 5: PMTiles
-  setStep('pmtiles', 'active');
-  stepStart = performance.now();
-  meta.name = inputName;
-  const pmtilesData = await assemblePMTiles(allTiles, meta);
-  setStep('pmtiles', 'done', `${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
-
-  return {
-    name: `${inputName}.pmtiles`,
-    blob: new Blob([pmtilesData], { type: 'application/octet-stream' }),
-    mbtilesBlob,
-    mbtilesName: `${inputName}.mbtiles`,
-    mbtilesSize: mbtilesBytes.length,
-    inputSize: file.size,
-    outputSize: pmtilesData.length,
-    tiles: allTiles.length,
-  };
 }
 
 // ============================================================
@@ -1285,10 +1378,7 @@ async function startConversion() {
   resetSteps();
   setStep('init', 'active');
   if (!Gdal) {
-    Gdal = await initGdalJs({
-      path: 'https://cdn.jsdelivr.net/npm/gdal3.js@2.8.1/dist/package',
-      useWorker: false,
-    });
+    Gdal = await initGdalJs(GDAL_CONFIG);
   }
   setStep('init', 'done', '0.0s');
 
@@ -1322,9 +1412,10 @@ async function startConversion() {
       log(`Done: ${result.name} — ${formatBytes(result.outputSize)}, ${result.tiles} tiles, ${elapsed}s`, 'ok');
     } catch (e) {
       failCount++;
-      results.push({ name: file.name, error: e.message, inputSize: file.size });
-      setFileStatus(i, 'error', `❌ ${e.message.substring(0, 30)}`);
-      log(`Error: ${file.name} — ${e.message}`, 'error');
+      const msg = (e && e.message) || (Array.isArray(e) && e[0] && e[0].message) || String(e);
+      results.push({ name: file.name, error: msg, inputSize: file.size });
+      setFileStatus(i, 'error', `❌ ${msg.substring(0, 40)}`);
+      log(`Error: ${file.name} — ${msg}`, 'error');
       console.error(e);
 
       // Mark current active step as error
